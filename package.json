@@ -1,0 +1,29 @@
+{
+  "name": "ocpp-webserver",
+  "version": "1.0.0",
+  "description": "A simple express webserver with REST-ish routes allowing control of an OCPP-enabled EVSE.",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gcochard/ocpp-webserver.git"
+  },
+  "keywords": [
+    "OCPP",
+    "REST"
+  ],
+  "author": "Greg Cochard",
+  "license": "AGPL-3.0-or-later",
+  "bugs": {
+    "url": "https://github.com/gcochard/ocpp-webserver/issues"
+  },
+  "homepage": "https://github.com/gcochard/ocpp-webserver#readme",
+  "dependencies": {
+    "express": "^4.18.2",
+    "moment": "^2.29.4",
+    "ocpp-rpc": "^2.0.0"
+  }
+}
