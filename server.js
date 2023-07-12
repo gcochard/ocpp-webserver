@@ -1,35 +1,75 @@
 const config = require('./config.json');
+const { port, charger_name, loglevel = 'info' } = config;
+const loglevels = {
+    silly: 0,
+    debug: 1,
+    info: 2,
+    warn: 3,
+    err: 4,
+    fatal: 5
+};
 const moment = require('moment');
 const { EventEmitter } = require('node:events');
 const clients = new Map();
+
+function createLogger(level) {
+    if(!Object.hasOwn(loglevels, level)){
+        throw new Error(`Loglevel ${level} does not exist`);
+    }
+    const logger = loglevels[level] >= level ? console.error : console.log;
+    if(loglevels[level] < loglevel){
+        return function(){};
+    }
+    return function(){
+        var first_parameter = arguments[0];
+        var other_parameters = Array.prototype.slice.call(arguments, 1);
+
+        if(other_parameters.length){
+            logger.apply(console, [`[${moment().format()}] [${level}] ` + first_parameter].concat(other_parameters));
+        } else {
+            logger.apply(console, [`[${moment().format()}] [${level}]`, first_parameter]);
+        }
+    };
+}
+
+const log = {
+    silly: createLogger('silly'),
+    debug: createLogger('debug'),
+    info: createLogger('info'),
+    warn: createLogger('warn'),
+    warning: createLogger('warn'),
+    err: createLogger('err'),
+    error: createLogger('err'),
+    fatal: createLogger('fatal')
+};
 
 function calculateStartTime(){
     const now = moment();
     const startTime = moment();
     const dayOfWeek = now.day();
-    console.log(`day of week: ${dayOfWeek}`);
+    log.debug(`day of week: ${dayOfWeek}`);
     if(dayOfWeek == 0 || dayOfWeek == 6 || dayOfWeek == 7){
-        console.log(`weekend`);
-        console.log(`now: ${now.format()}`);
+        log.silly(`weekend`);
+        log.debug(`now: ${now.format()}`);
         // this is the weekend
         if(now.hour() < 14){
-            console.log(`not yet 2:00pm`,);
+            log.info(`not yet 2:00pm`,);
             // start it!
         } else {
-            console.log(`past 2:00pm, deferring until tomorrow`);
+            log.info(`past 2:00pm, deferring until tomorrow`);
             // set it to midnight
             startTime.hour(0).minute(0).second(0).add(1, 'day');
         }
     } else {
         // this is a weekday
-        console.log(`weekday`);
-        console.log(`now: ${now.format()}`);
+        log.silly(`weekday`);
+        log.debug(`now: ${now.format()}`);
         if(now.hour() < 6){
-            console.log(`not yet 6:00am`,);
+            log.info(`not yet 6:00am`,);
             // start it!
         } else {
             // set it to midnight
-            console.log(`past 6:00am, deferring until tomorrow`);
+            log.info(`past 6:00am, deferring until tomorrow`);
             startTime.hour(0).minute(0).second(0).add(1, 'day');
         }
     }
@@ -38,42 +78,15 @@ function calculateStartTime(){
 
 (async function(){
     const { RPCServer, createRPCError } = require('ocpp-rpc');
-    const { port, charger_name } = config;
     const express = require('express');
     const app = express();
-    const httpServer = app.listen(port);
+    const httpServer = app.listen(port, '0.0.0.0');
     const util = require('util');
 
-	var log = console.log;
-
-	console.log = function () {
-		var first_parameter = arguments[0];
-		var other_parameters = Array.prototype.slice.call(arguments, 1);
-
-		function formatConsoleDate (date) {
-			var hour = date.getHours();
-			var minutes = date.getMinutes();
-			var seconds = date.getSeconds();
-			var milliseconds = date.getMilliseconds();
-
-			return '[' +
-				((hour < 10) ? '0' + hour: hour) +
-				':' +
-				((minutes < 10) ? '0' + minutes: minutes) +
-				':' +
-				((seconds < 10) ? '0' + seconds: seconds) +
-				'.' +
-				('00' + milliseconds).slice(-3) +
-				'] ';
-		}
-
-        if(other_parameters.length){
-            log.apply(console, ['['+moment().format()+'] ' + first_parameter].concat(other_parameters));
-        } else {
-            log.apply(console, ['['+moment().format()+'] ', first_parameter]);
-        }
-	};
-
+    app.use((req, res, next) => {
+        next();
+        console.log(`${req.ip} - - [${moment().toDate().toUTCString()}] "${req.method} ${req.path} HTTP/${req.httpVersion}" ${res.statusCode} ${res.get('content-length')}`);
+    });
     app.get('/clients', (req, res) => {
         return res.json(Array.from(clients.keys()));
     });
@@ -93,7 +106,7 @@ function calculateStartTime(){
             return res.status(503).send('Client not connected');
         }
         const response = await clients.get(req.params.client).call('GetConfiguration', { });
-        console.log(response);
+        log.debug(response);
         res.json(response);
     });
 
@@ -119,7 +132,7 @@ function calculateStartTime(){
             }
         });
         const response = await client.call('TriggerMessage', { requestedMessage: req.params.msg});
-        console.log(response);
+        log.debug(response);
         //res.json(response);
     });
 
@@ -128,7 +141,7 @@ function calculateStartTime(){
             return res.status(503).send('Client not connected');
         }
         const response = await clients.get(req.params.client).call('Reset', { type: 'Soft' });
-        console.log(util.inspect(response));
+        log.debug(response);
         res.status(200).send('terminated connection');
     });
 
@@ -137,7 +150,7 @@ function calculateStartTime(){
             return res.status(503).send('Client not connected');
         }
         const response = await clients.get(req.params.client).call('RemoteStartTransaction', { connectorId: 1, idTag: charger_name });
-        console.log(util.inspect(response));
+        log.debug(response);
         res.status(200).send('started charge session');
     });
 
@@ -159,14 +172,14 @@ function calculateStartTime(){
             return res.status(400).send('No transaction in progress');
         }
         const response = await client.call('RemoteStopTransaction', { transactionId: client.session.transactionId });
-        console.log(util.inspect(response));
+        log.debug(response);
         res.status(200).send('stopped charge session');
     });
 
     app.get('/softreset', async (req, res) => {
         for (const client of clients.values()) {
             const response = await client.call('Reset', { type: 'Soft' });
-            console.log(util.inspect(response));
+            log.debug(response);
         }
         res.status(200).send('terminated connections');
     });
@@ -186,13 +199,13 @@ function calculateStartTime(){
     });
 
     server.on('client', async (client) => {
-        console.log(`${client.session.sessionId} connected!`); // `XYZ123 connected!`
+        log.info(`${client.session.sessionId} connected!`); // `XYZ123 connected!`
         clients.set(client.session.sessionId, client);
         client.session.ee = new EventEmitter();
 
         // create a specific handler for handling BootNotification requests
         client.handle('BootNotification', ({params}) => {
-            console.log(`Server got BootNotification from ${client.identity}:`, params);
+            log.info(`Server got BootNotification from ${client.identity}:`, params);
 
             client.session.ee.emit('BootNotification', params);
             // respond to accept the client
@@ -205,7 +218,7 @@ function calculateStartTime(){
 
         // create a specific handler for handling Heartbeat requests
         client.handle('Heartbeat', ({params}) => {
-            console.log(`Server got Heartbeat from ${client.identity}:`, params);
+            log.info(`Server got Heartbeat from ${client.identity}:`, params);
 
             client.session.ee.emit('Heartbeat', params);
             // respond with the server's current time.
@@ -216,21 +229,20 @@ function calculateStartTime(){
 
         // create a specific handler for handling StatusNotification requests
         client.handle('StatusNotification', ({params}) => {
-            console.log(`Server got StatusNotification from ${client.identity}:`, params);
-            console.log(`status: ${params.status}`);
+            log.info(`Server got StatusNotification from ${client.identity}:`, params);
+            log.debug(`status: ${params.status}`);
             const startTime = calculateStartTime();
             const now = moment();
             const dayOfWeek = now.day();
-            console.log(`day of week: ${dayOfWeek}`);
+            log.silly(`day of week: ${dayOfWeek}`);
             // available == waiting to be plugged in
             // preparing == car is plugged in
             if(params.status == 'Preparing'){
-                console.log('calculating start time...');
-                console.log(`startTime set to ${startTime.format()}`);
+                log.info(`startTime set to ${startTime.format()}`);
                 setTimeout(async () => {
                     const endTime = moment();
                     const dayOfWeek = now.day();
-                    console.log(`day of week: ${dayOfWeek}`);
+                    log.silly(`day of week: ${dayOfWeek}`);
                     if(dayOfWeek == 0 || dayOfWeek == 6 || dayOfWeek == 7){
                         endTime.hour(14);
                     } else {
@@ -239,9 +251,9 @@ function calculateStartTime(){
                     const response = await client.call('RemoteStartTransaction', { connectorId: params.connectorId, idTag: charger_name });
 
                     if (response.status === 'Accepted') {
-                        console.log('Remote start worked!');
+                        log.info('Remote start worked!');
                     } else {
-                        console.log('Remote start rejected.');
+                        log.warn('Remote start rejected.');
                     }
                     setTimeout(async () => {
                         const response = await client.call('RemoteStopTransaction', { connectorId: params.connectorId, idTag: charger_name });
@@ -253,12 +265,12 @@ function calculateStartTime(){
         });
 
         client.handle('StartTransaction', ({params}) => {
-            console.log(`Server got StartTransaction from ${client.identity}:`, params);
+            log.info(`Server got StartTransaction from ${client.identity}:`, params);
             //console.log(`status: ${params.status}`);
             const now = moment();
             const startTime = moment();
             const dayOfWeek = now.day();
-            console.log(`day of week: ${dayOfWeek}`);
+            log.silly(`day of week: ${dayOfWeek}`);
             // available == waiting to be plugged in
             // preparing == car is plugged in
             if(Object.keys(client.session).indexOf('transactionId') !== -1){
@@ -276,11 +288,11 @@ function calculateStartTime(){
         });
 
         client.handle('StopTransaction', ({params}) => {
-            console.log(`Server got StopTransaction from ${client.identity}:`, params);
+            log.info(`Server got StopTransaction from ${client.identity}:`, params);
             const now = moment();
             const startTime = moment();
             const dayOfWeek = now.day();
-            console.log(`day of week: ${dayOfWeek}`);
+            log.silly(`day of week: ${dayOfWeek}`);
             // available == waiting to be plugged in
             // preparing == car is plugged in
             if(Object.keys(client.session).indexOf('transactionId') !== -1 && client.session.transactionId == params.transactionId){
@@ -293,8 +305,8 @@ function calculateStartTime(){
         });
 
         client.handle('MeterValues', ({params}) => {
-            console.log(`Server got MeterValues from ${client.identity}:`, params);
-            console.log(params.meterValue[0].sampledValue);
+            log.info(`Server got MeterValues from ${client.identity}:`, params);
+            log.info(params.meterValue[0].sampledValue);
             client.session.ee.emit('MeterValues', params);
             return {};
         });
@@ -302,7 +314,7 @@ function calculateStartTime(){
         // create a wildcard handler to handle any RPC method
         client.handle(({method, params}) => {
             // This handler will be called if the incoming method cannot be handled elsewhere.
-            console.log(`Server got ${method} from ${client.identity}:`, params);
+            log.warn(`Server got ${method} from ${client.identity}:`, params);
 
             client.session.ee.emit(method, params);
             // throw an RPC error to inform the server that we don't understand the request.
@@ -311,5 +323,6 @@ function calculateStartTime(){
     });
 
     //await server.listen(port);
-    console.log(`server listening on port ${port}`);
+    log.info(`server listening on port ${port}`);
 }());
+// vim: set et sw=4 sts=4 ts=4 :
