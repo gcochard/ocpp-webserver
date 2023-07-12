@@ -118,6 +118,9 @@ function calculateStartTime(){
         if(['StatusNotification', 'BootNotification', 'Heartbeat', 'MeterValues'].indexOf(req.params.msg) === -1){
             return res.status(400).send('invalid message');
         }
+        if(req.params.msg == 'MeterValues' && Object.keys(client.session).indexOf('transactionId') === -1){
+            return res.status(400).send('No transaction in progress, no meter values will be sent');
+        }
         let sent = false;
         const timeout = setTimeout(() => {
             if(!sent){
@@ -200,8 +203,16 @@ function calculateStartTime(){
 
     server.on('client', async (client) => {
         log.info(`${client.session.sessionId} connected!`); // `XYZ123 connected!`
-        clients.set(client.session.sessionId, client);
+        // clients reconnect often for whatever reason, keep the session vars
+        client.session.transactions = {};
         client.session.ee = new EventEmitter();
+        if(clients.has(client.session.sessionId)){
+            const oldsession = clients.get(client.session.sessionId).session;
+            client.session.lastTransactionId = oldsession.lastTransactionId;
+            client.session.transactions = oldsession.transactions;
+            client.session.ee = oldsession.ee;
+        }
+        clients.set(client.session.sessionId, client);
 
         // create a specific handler for handling BootNotification requests
         client.handle('BootNotification', ({params}) => {
@@ -239,7 +250,11 @@ function calculateStartTime(){
             // preparing == car is plugged in
             if(params.status == 'Preparing'){
                 log.info(`startTime set to ${startTime.format()}`);
-                setTimeout(async () => {
+                if(client.session.startTimeout){
+                    clearTimeout(client.session.startTimeout);
+                }
+                client.session.startTime = startTime.format();
+                client.session.startTimeout = setTimeout(async () => {
                     const endTime = moment();
                     const dayOfWeek = now.day();
                     log.silly(`day of week: ${dayOfWeek}`);
@@ -255,7 +270,11 @@ function calculateStartTime(){
                     } else {
                         log.warn('Remote start rejected.');
                     }
-                    setTimeout(async () => {
+                    if(client.session.endTimeout){
+                        clearTimeout(client.session.endTimeout);
+                    }
+                    client.session.endTime = endTime.format();
+                    client.session.endTimeout = setTimeout(async () => {
                         const response = await client.call('RemoteStopTransaction', { connectorId: params.connectorId, idTag: charger_name });
                     }, endTime.diff(now));
                 }, startTime.diff(now));
@@ -281,6 +300,8 @@ function calculateStartTime(){
                 client.session.transactionId = 1;
             }
             client.session.ee.emit('StartTransaction', params);
+            client.session.transactions ??= {};
+            client.session.transactions[client.session.transactionId] = {meterValues: []};
             return {
                 idTagInfo: {status: 'Accepted'},
                 transactionId: client.session.transactionId
@@ -308,6 +329,7 @@ function calculateStartTime(){
             log.info(`Server got MeterValues from ${client.identity}:`, params);
             log.info(params.meterValue[0].sampledValue);
             client.session.ee.emit('MeterValues', params);
+            client.session.transactions[client.session.transactionId].meterValues.push(params);
             return {};
         });
 
