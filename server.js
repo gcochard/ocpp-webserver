@@ -157,12 +157,20 @@ function calculateStartTime(){
         res.status(200).send('started charge session');
     });
 
+    app.get('/clients/:client/transactions', async (req, res) => {
+        if(!clients.has(req.params.client)){
+            return res.status(503).send('Client not connected');
+        }
+        const client = clients.get(req.params.client);
+        res.json(client.session.transactions);
+    });
+
     app.get('/clients/:client/status', async (req, res) => {
         if(!clients.has(req.params.client)){
             return res.status(503).send('Client not connected');
         }
         const client = clients.get(req.params.client);
-        res.json(client.session);
+        res.send(util.inspect(client.session, {compact: false}));
     });
 
     app.get('/clients/:client/stop', async (req, res) => {
@@ -292,12 +300,10 @@ function calculateStartTime(){
             log.silly(`day of week: ${dayOfWeek}`);
             // available == waiting to be plugged in
             // preparing == car is plugged in
-            if(Object.keys(client.session).indexOf('transactionId') !== -1){
-                client.session.transactionId++;
-            } else if(Object.keys(client.session).indexOf('lastTransactionId') !== -1){
+            client.session.transactionId ??= 0;
+            client.session.transactionId++;
+            if(Object.keys(client.session).indexOf('lastTransactionId') !== -1 && !isNaN(client.session.lastTransactionId)){
                 client.session.transactionId = client.session.lastTransactionId+1;
-            } else {
-                client.session.transactionId = 1;
             }
             client.session.ee.emit('StartTransaction', params);
             client.session.transactions ??= {};
@@ -314,8 +320,7 @@ function calculateStartTime(){
             const startTime = moment();
             const dayOfWeek = now.day();
             log.silly(`day of week: ${dayOfWeek}`);
-            // available == waiting to be plugged in
-            // preparing == car is plugged in
+            client.session.transactions[client.session.transactionId].meterValues.push(params.transactionData);
             if(Object.keys(client.session).indexOf('transactionId') !== -1 && client.session.transactionId == params.transactionId){
                 delete client.session.transactionId;
             }
