@@ -170,7 +170,8 @@ function calculateStartTime(){
             return res.status(503).send('Client not connected');
         }
         const client = clients.get(req.params.client);
-        res.send(util.inspect(client.session, {compact: false}));
+        res.set('content-type', 'text/plain');
+        res.send(util.inspect(client.session, {compact: false, depth: 8}));
     });
 
     app.get('/clients/:client/stop', async (req, res) => {
@@ -250,6 +251,9 @@ function calculateStartTime(){
         client.handle('StatusNotification', ({params}) => {
             log.info(`Server got StatusNotification from ${client.identity}:`, params);
             log.debug(`status: ${params.status}`);
+            client.session.status = params.status;
+            client.session.statusNotifications ??= [];
+            client.session.statusNotifications.push(params);
             const startTime = calculateStartTime();
             const now = moment();
             const dayOfWeek = now.day();
