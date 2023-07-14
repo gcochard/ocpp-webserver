@@ -1,6 +1,6 @@
 const config = require('./config.json');
 const fs = require('fs');
-const { port, charger_name, loglevel = 'info' } = config;
+const { port, charger_name, loglevel = 'debug' } = config;
 const loglevels = {
     silly: 0,
     debug: 1,
@@ -17,8 +17,8 @@ function createLogger(level) {
     if(!Object.hasOwn(loglevels, level)){
         throw new Error(`Loglevel ${level} does not exist`);
     }
-    const logger = loglevels[level] >= level ? console.error : console.log;
-    if(loglevels[level] < loglevel){
+    const logger = loglevels[level] >= 3 ? console.error : console.log;
+    if(loglevels[level] < loglevels[loglevel]){
         return function(){};
     }
     return function(){
@@ -47,6 +47,11 @@ const log = {
 function calculateStartTime(){
     const now = moment();
     const startTime = moment();
+    // according to https://github.com/lbbrhzn/ocpp/issues/442#issuecomment-1544805046
+    // we need to delay the start *at least* 1 second before sending RemoteStartTransaction after Preparing
+    // this should be fine to add 10 seconds
+    now.add(10, 'seconds');
+    startTime.add(10, 'seconds');
     const dayOfWeek = now.day();
     log.debug(`day of week: ${dayOfWeek}`);
     if(dayOfWeek == 0 || dayOfWeek == 6 || dayOfWeek == 7){
@@ -116,11 +121,35 @@ class GlobEmitter extends EventEmitter {
         if(!clients.has(req.params.client)){
             return res.status(503).send('Client not connected');
         }
-        const options = {};
-        if(req.query.pretty){
-            options.compact = false;
-        }
-        return res.send(util.inspect(clients.get(req.params.client), options));
+        const { client } = req.params;
+        res.send(
+`<!DOCTYPE html>
+<html>
+  <head>
+    <title>${client} status</title>
+  </head>
+  <body>
+    <div>
+      <form method="post">
+        <ul>
+          <li><button formaction="/clients/${client}/trigger/BootNotification">Trigger BootNotification</button></li>
+          <li><button formaction="/clients/${client}/trigger/StatusNotification">Trigger StatusNotification</button></li>
+          <li><button formaction="/clients/${client}/trigger/Heartbeat">Trigger Heartbeat</button></li>
+          <li><button formaction="/clients/${client}/trigger/MeterValues">Trigger MeterValues</button></li>
+        </ul>
+        <ul>
+          <li><button formaction="/clients/${client}/start">Start charge session</button></li>
+          <li><button formaction="/clients/${client}/stop">Stop charge session</button></li>
+          <li><button formaction="/clients/${client}/softreset">Soft reset charger</button></li>
+        </ul>
+      </form>
+    </div>
+    <div>
+      <pre>${JSON.stringify(clients.get(client).session, null, 2)}</pre>
+    </div>
+  </body>
+</html>
+`);
     });
 
     app.get('/clients/:client/config', async (req, res) => {
@@ -132,7 +161,7 @@ class GlobEmitter extends EventEmitter {
         res.json(response);
     });
 
-    app.get('/clients/:client/trigger/:msg', async (req, res) => {
+    app.post('/clients/:client/trigger/:msg', async (req, res) => {
         if(!clients.has(req.params.client)){
             return res.status(503).send('Client not connected');
         }
@@ -161,7 +190,7 @@ class GlobEmitter extends EventEmitter {
         //res.json(response);
     });
 
-    app.get('/clients/:client/softreset', async (req, res) => {
+    app.post('/clients/:client/softreset', async (req, res) => {
         if(!clients.has(req.params.client)){
             return res.status(503).send('Client not connected');
         }
@@ -175,7 +204,7 @@ class GlobEmitter extends EventEmitter {
         }
     });
 
-    app.get('/clients/:client/start', async (req, res) => {
+    app.post('/clients/:client/start', async (req, res) => {
         if(!clients.has(req.params.client)){
             return res.status(503).send('Client not connected');
         }
@@ -201,7 +230,7 @@ class GlobEmitter extends EventEmitter {
         res.send(util.inspect(client.session, {compact: false, depth: 8}));
     });
 
-    app.get('/clients/:client/stop', async (req, res) => {
+    app.post('/clients/:client/stop', async (req, res) => {
         if(!clients.has(req.params.client)){
             return res.status(503).send('Client not connected');
         }
@@ -215,7 +244,7 @@ class GlobEmitter extends EventEmitter {
         res.status(200).send('stopped charge session');
     });
 
-    app.get('/softreset', async (req, res) => {
+    app.post('/softreset', async (req, res) => {
         for (const client of clients.values()) {
             const response = await client.call('Reset', { type: 'Soft' });
             log.debug(response);
@@ -226,6 +255,10 @@ class GlobEmitter extends EventEmitter {
     const server = new RPCServer({
         protocols: ['ocpp1.6'], // server accepts ocpp1.6 subprotocol
         strictMode: false,      // disable strict validation of requests & responses
+        // disable websocket pings, as this periodically disconnects grizzl-e chargers due to a
+        // non-conformant pong implementation.
+        // see https://github.com/lbbrhzn/ocpp/issues/442#issuecomment-1498396328 for details
+        pingIntervalMs: 0,
     });
     httpServer.on('upgrade', server.handleUpgrade);
 
@@ -244,10 +277,36 @@ class GlobEmitter extends EventEmitter {
         client.session.transactions = {};
         if(clients.has(client.session.sessionId)){
             const oldsession = clients.get(client.session.sessionId).session;
-            client.session.lastTransactionId = oldsession.lastTransactionId;
+            if(Object.hasOwn(oldsession, 'lastTransactionId')){
+                client.session.lastTransactionId = oldsession.lastTransactionId;
+            }
             client.session.transactions = oldsession.transactions;
         }
         clients.set(client.session.sessionId, client);
+        client.on('message', msg => {
+            log.debug(`message: ${util.inspect(msg)}`);
+        });
+        client.on('socketError', err => {
+            log.error('socket error', err);
+        });
+        client._ws.on('message', msg => {
+            log.debug(`ws message: ${msg}`);
+        });
+        client._ws.on('ping', msg => {
+            log.debug(`ws ping: ${msg}`);
+        });
+        client._ws.on('pong', msg => {
+            log.debug(`ws pong: ${msg}`);
+        });
+        client._ws.on('error', msg => {
+            log.debug(`ws error: ${msg}`);
+        });
+        client._ws.on('close', msg => {
+            log.debug(`ws close: ${msg}`);
+        });
+        client.on('ping', ev => {
+            log.debug(`client ping: ${ev.rtt}`);
+        });
 
         // create a specific handler for handling BootNotification requests
         client.handle('BootNotification', ({params}) => {
