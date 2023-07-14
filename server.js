@@ -1,4 +1,5 @@
 const config = require('./config.json');
+const fs = require('fs');
 const { port, charger_name, loglevel = 'info' } = config;
 const loglevels = {
     silly: 0,
@@ -76,12 +77,33 @@ function calculateStartTime(){
     return startTime;
 }
 
+/**
+ * Taken from https://stackoverflow.com/a/54431931/1355166
+ * Emit all events on '*' and then re-emit
+ */
+class GlobEmitter extends EventEmitter {
+    emit(type, ...args) {
+        super.emit('*', [type, ...args]);
+        return super.emit(type, ...args) || super.emit('', ...args);
+    }
+}
 (async function(){
     const { RPCServer, createRPCError } = require('ocpp-rpc');
     const express = require('express');
     const app = express();
     const httpServer = app.listen(port, '0.0.0.0');
     const util = require('util');
+    const ee = new GlobEmitter();
+    const evtStream = fs.createWriteStream('./eventlog.log', {flags: 'a'});
+    ee.on('*', args => {
+        let sargs = '';
+        try {
+            sargs = JSON.stringify(args);
+        } catch(e){
+            sargs = util.inspect(args, {depth: 8});
+        }
+        evtStream.write(`${sargs}\n`);
+    });
 
     app.use((req, res, next) => {
         next();
@@ -128,7 +150,7 @@ function calculateStartTime(){
                 res.status(503).send('Timeout while waiting for response');
             }
         }, 30000);
-        client.session.ee.once(req.params.msg, resp => {
+        ee.once(`${req.params.client}:${req.params.msg}`, resp => {
             if(!sent){
                 res.json(resp);
                 clearTimeout(timeout);
@@ -143,9 +165,14 @@ function calculateStartTime(){
         if(!clients.has(req.params.client)){
             return res.status(503).send('Client not connected');
         }
-        const response = await clients.get(req.params.client).call('Reset', { type: 'Soft' });
-        log.debug(response);
-        res.status(200).send('terminated connection');
+        try{
+            const response = await clients.get(req.params.client).call('Reset', { type: 'Soft' });
+            log.debug(response);
+            res.status(200).send('terminated connection');
+        } catch(e) {
+            log.error(e);
+            res.status(503).send(e.message);
+        }
     });
 
     app.get('/clients/:client/start', async (req, res) => {
@@ -213,13 +240,12 @@ function calculateStartTime(){
     server.on('client', async (client) => {
         log.info(`${client.session.sessionId} connected!`); // `XYZ123 connected!`
         // clients reconnect often for whatever reason, keep the session vars
+        ee.emit('client', client.session);
         client.session.transactions = {};
-        client.session.ee = new EventEmitter();
         if(clients.has(client.session.sessionId)){
             const oldsession = clients.get(client.session.sessionId).session;
             client.session.lastTransactionId = oldsession.lastTransactionId;
             client.session.transactions = oldsession.transactions;
-            client.session.ee = oldsession.ee;
         }
         clients.set(client.session.sessionId, client);
 
@@ -227,7 +253,7 @@ function calculateStartTime(){
         client.handle('BootNotification', ({params}) => {
             log.info(`Server got BootNotification from ${client.identity}:`, params);
 
-            client.session.ee.emit('BootNotification', params);
+            ee.emit(`${client.session.sessionId}:BootNotification`, params);
             // respond to accept the client
             return {
                 status: "Accepted",
@@ -240,7 +266,7 @@ function calculateStartTime(){
         client.handle('Heartbeat', ({params}) => {
             log.info(`Server got Heartbeat from ${client.identity}:`, params);
 
-            client.session.ee.emit('Heartbeat', params);
+            ee.emit(`${client.session.sessionId}:Heartbeat`, params);
             // respond with the server's current time.
             return {
                 currentTime: new Date().toISOString()
@@ -287,11 +313,11 @@ function calculateStartTime(){
                     }
                     client.session.endTime = endTime.format();
                     client.session.endTimeout = setTimeout(async () => {
-                        const response = await client.call('RemoteStopTransaction', { connectorId: params.connectorId, idTag: charger_name });
+                        const response = await client.call('RemoteStopTransaction', { transactionId: client.session.transactionId });
                     }, endTime.diff(now));
                 }, startTime.diff(now));
             }
-            client.session.ee.emit('StatusNotification', params);
+            ee.emit(`${client.session.sessionId}:StatusNotification`, params);
             return {};
         });
 
@@ -309,7 +335,7 @@ function calculateStartTime(){
             if(Object.keys(client.session).indexOf('lastTransactionId') !== -1 && !isNaN(client.session.lastTransactionId)){
                 client.session.transactionId = client.session.lastTransactionId+1;
             }
-            client.session.ee.emit('StartTransaction', params);
+            ee.emit(`${client.session.sessionId}:StartTransaction`, params);
             client.session.transactions ??= {};
             client.session.transactions[client.session.transactionId] = {meterValues: []};
             return {
@@ -330,14 +356,14 @@ function calculateStartTime(){
             }
             client.session.lastTransactionId = params.transactionId;
             client.session.lastTransaction = params.transactionData;
-            client.session.ee.emit('StopTransaction', params);
+            ee.emit(`${client.session.sessionId}:StopTransaction`, params);
             return {};
         });
 
         client.handle('MeterValues', ({params}) => {
             log.info(`Server got MeterValues from ${client.identity}:`, params);
             log.info(params.meterValue[0].sampledValue);
-            client.session.ee.emit('MeterValues', params);
+            ee.emit(`${client.session.sessionId}:MeterValues`, params);
             client.session.transactions[client.session.transactionId].meterValues.push(params);
             return {};
         });
@@ -347,7 +373,7 @@ function calculateStartTime(){
             // This handler will be called if the incoming method cannot be handled elsewhere.
             log.warn(`Server got ${method} from ${client.identity}:`, params);
 
-            client.session.ee.emit(method, params);
+            ee.emit(`${client.session.sessionId}:${method}`, params);
             // throw an RPC error to inform the server that we don't understand the request.
             throw createRPCError("NotImplemented");
         });
