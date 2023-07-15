@@ -122,6 +122,7 @@ class GlobEmitter extends EventEmitter {
             return res.status(503).send('Client not connected');
         }
         const { client } = req.params;
+        const sess = util.inspect(clients.get(client).session, {compact: false, depth: 8});
         res.send(
 `<!DOCTYPE html>
 <html>
@@ -145,7 +146,7 @@ class GlobEmitter extends EventEmitter {
       </form>
     </div>
     <div>
-      <pre>${JSON.stringify(clients.get(client).session, null, 2)}</pre>
+      <pre>${sess}</pre>
     </div>
   </body>
 </html>
