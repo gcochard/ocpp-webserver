@@ -1,3 +1,4 @@
+const process = require('node:process');
 const config = require('./config.json');
 const fs = require('fs');
 const { port, charger_name, loglevel = 'debug' } = config;
@@ -80,6 +81,47 @@ function calculateStartTime(){
         }
     }
     return startTime;
+}
+
+let stateWritten = false;
+function exitHandler(eventName){
+    log.info(`exitHandler registered for ${eventName}`);
+    return (code) => {
+        const state = {};
+        if(!stateWritten){
+            log.info('shutting down, dumping state');
+            for (const client of clients.values()) {
+                const {
+                    status, statusNotifications, startTime,
+                    endTime, transactions, transactionId,
+                    lastTransaction, lastTransactionId, sessionId
+                } = client.session;
+                state[sessionId] = {
+                    status, statusNotifications, startTime,
+                    endTime, transactions, transactionId,
+                    lastTransaction, lastTransactionId, sessionId
+                };
+            }
+            fs.writeFileSync('./state.json', JSON.stringify(state));
+            stateWritten = true;
+        }
+        if(code == 'SIGINT'){
+            process.exit();
+        }
+    };
+}
+// ctrl+c doesn't trigger the `exit` event, so we have to handle it in SIGINT
+process.on('exit', exitHandler('exit'));
+process.on('SIGINT', exitHandler('SIGINT'));
+let state = {};
+try {
+    state = require('./state.json');
+    for(const client of Object.values(state)){
+        log.debug(`loading state for client: ${client.sessionId}`);
+        clients.set(client.sessionId, {session: {...client}});
+    }
+} catch(e){
+    log.debug('no state, not restoring it');
 }
 
 /**
@@ -178,15 +220,18 @@ class GlobEmitter extends EventEmitter {
             if(!sent){
                 sent = true;
                 res.status(503).send('Timeout while waiting for response');
+                ee.off(`${req.params.client}:${req.params.msg}`, listener);
             }
         }, 30000);
-        ee.once(`${req.params.client}:${req.params.msg}`, resp => {
+        const listener = resp => {
             if(!sent){
+                sent = true;
                 res.json(resp);
                 clearTimeout(timeout);
             }
-        });
-        const response = await client.call('TriggerMessage', { requestedMessage: req.params.msg});
+        };
+        ee.once(`${req.params.client}:${req.params.msg}`, listener);
+        const response = await client.safeCall('TriggerMessage', { requestedMessage: req.params.msg});
         log.debug(response);
         //res.json(response);
     });
@@ -240,17 +285,25 @@ class GlobEmitter extends EventEmitter {
             // no known session...
             return res.status(400).send('No transaction in progress');
         }
-        const response = await client.call('RemoteStopTransaction', { transactionId: client.session.transactionId });
+        const response = await client.safeCall('RemoteStopTransaction', { transactionId: client.session.transactionId });
         log.debug(response);
         res.status(200).send('stopped charge session');
     });
 
     app.post('/softreset', async (req, res) => {
         for (const client of clients.values()) {
-            const response = await client.call('Reset', { type: 'Soft' });
+            const response = await client.safeCall('Reset', { type: 'Soft' });
             log.debug(response);
         }
         res.status(200).send('terminated connections');
+    });
+
+    app.get('/metrics', (req, res) => {
+        res.status(200).send(
+`foo {charger="grizzbox"} 1
+bar {charger="grizzbox"}
+`
+        );
     });
 
     const server = new RPCServer({
@@ -272,6 +325,27 @@ class GlobEmitter extends EventEmitter {
     });
 
     server.on('client', async (client) => {
+        async function safeCall(...args){
+            try{
+                const result = await client.call(...args);
+                return result;
+            } catch(e) {
+                return false;
+            }
+        }
+        let triggeredStatus = false;
+        client.safeCall = safeCall;
+        function triggerStatus(){
+            if(!triggeredStatus){
+                // we need to trigger a StatusNotification to rebuild the startTime and endTime and respective timeouts
+                triggeredStatus = true;
+                setTimeout(async () => {
+                    const resp = await client.safeCall('TriggerMessage', { requestedMessage: 'StatusNotification'});
+                    log.debug(resp);
+                }, 100);
+            }
+        }
+
         log.info(`${client.session.sessionId} connected!`); // `XYZ123 connected!`
         // clients reconnect often for whatever reason, keep the session vars
         ee.emit('client', client.session);
@@ -282,13 +356,43 @@ class GlobEmitter extends EventEmitter {
                 client.session.lastTransactionId = oldsession.lastTransactionId;
             }
             client.session.transactions = oldsession.transactions;
+            if(Object.hasOwn(oldsession, 'statusNotifications')){
+                client.session.statusNotifications = oldsession.statusNotifications;
+            }
+            if(Object.hasOwn(oldsession, 'status')){
+                client.session.status = oldsession.status;
+            }
+            if(Object.hasOwn(oldsession, 'startTime')){
+                client.session.startTime = oldsession.startTime;
+                client.session.startTimeout = oldsession.startTimeout;
+            }
+            if(Object.hasOwn(oldsession, 'endTime')){
+                client.session.endTime = oldsession.endTime;
+                client.session.endTimeout = oldsession.endTimeout;
+            }
+            triggerStatus();
         }
+        client.session.connected = true;
+
         clients.set(client.session.sessionId, client);
         client.on('message', msg => {
             log.debug(`message: ${util.inspect(msg)}`);
         });
         client.on('socketError', err => {
-            log.error('socket error', err);
+            log.error(`socket error: ${err.message}`);
+            client.session.connected = false;
+        });
+        client.on('disconnect', ({code, reason}) => {
+            log.error(`client disconnected; code: ${code}, reason: ${reason}`);
+            client.session.connected = false;
+        });
+        client.on('close', ({code, reason}) => {
+            log.error(`client closed; code: ${code}, reason: ${reason}`);
+            client.session.connected = false;
+        });
+        client.on('open', (result) => {
+            log.info(`client (re)connected; result: ${result}`);
+            client.session.connected = true;
         });
         client._ws.on('message', msg => {
             log.debug(`ws message: ${msg}`);
@@ -361,19 +465,25 @@ class GlobEmitter extends EventEmitter {
                     } else {
                         endTime.hour(6);
                     }
-                    const response = await client.call('RemoteStartTransaction', { connectorId: params.connectorId, idTag: charger_name });
+                    const response = await safeCall('RemoteStartTransaction', { connectorId: params.connectorId, idTag: charger_name });
 
                     if (response.status === 'Accepted') {
-                        log.info('Remote start worked!');
+                        log.info('Remote start worked!', response);
                     } else {
-                        log.warn('Remote start rejected.');
+                        log.warn('Remote start rejected.', response);
+                        return;
                     }
                     if(client.session.endTimeout){
                         clearTimeout(client.session.endTimeout);
                     }
                     client.session.endTime = endTime.format();
                     client.session.endTimeout = setTimeout(async () => {
-                        const response = await client.call('RemoteStopTransaction', { transactionId: client.session.transactionId });
+                        const response = await safeCall('RemoteStopTransaction', { transactionId: client.session.transactionId });
+                        if(response.status === 'Accepted'){
+                            log.info('Remote stop worked!', response);
+                        } else {
+                            log.warn('Remote stop rejected.', response);
+                        }
                     }, endTime.diff(now));
                 }, startTime.diff(now));
             }
