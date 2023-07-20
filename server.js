@@ -164,7 +164,19 @@ class GlobEmitter extends EventEmitter {
             return res.status(503).send('Client not connected');
         }
         const { client } = req.params;
-        const sess = util.inspect(clients.get(client).session, {compact: false, depth: 8});
+        log.debug('abridging transactions for status');
+        const abridgedSess = structuredClone(clients.get(client).session);
+        // if there's more than one transaction, take the last one
+        for(const txId in abridgedSess.transactions){
+            const tx = abridgedSess.transactions[txId];
+            log.debug(`checking ${txId}: tx.meterValues.length: ${tx.meterValues.length}`);
+            if(tx.meterValues.length > 100){
+                log.debug(`abridging transaction ${txId}`);
+                // take the first 75 and last 25
+                abridgedSess.transactions[txId].meterValues = [...tx.meterValues.slice(0, 75), ...tx.meterValues.slice(-25)];
+            }
+        }
+        const sess = util.inspect(abridgedSess, {compact: false, depth: 8});
         res.send(
 `<!DOCTYPE html>
 <html>
@@ -352,6 +364,9 @@ bar {charger="grizzbox"}
         client.session.transactions = {};
         if(clients.has(client.session.sessionId)){
             const oldsession = clients.get(client.session.sessionId).session;
+            if(Object.hasOwn(oldsession, 'transactionId')){
+                client.session.transactionId = oldsession.transactionId;
+            }
             if(Object.hasOwn(oldsession, 'lastTransactionId')){
                 client.session.lastTransactionId = oldsession.lastTransactionId;
             }
@@ -486,6 +501,20 @@ bar {charger="grizzbox"}
                         }
                     }, endTime.diff(now));
                 }, startTime.diff(now));
+            } else if(params.status == 'Available'){
+                // car is not plugged in, clean up any transactions in progress
+                if(Object.hasOwn(client.session,'transactionId')){
+                    client.session.lastTransactionId = client.session.transactionId;
+                    client.session.lastTransaction = client.session.transactions[client.session.transactionId];
+                    delete client.session.transactionId;
+                    if(Object.hasOwn(client.session,'endTimeout')){
+                        clearTimeout(client.session.endTimeout);
+                        delete client.session.endTimeout;
+                    }
+                    if(Object.hasOwn(client.session,'endTime')){
+                        delete client.session.endTime;
+                    }
+                }
             }
             ee.emit(`${client.session.sessionId}:StatusNotification`, params);
             return {};
