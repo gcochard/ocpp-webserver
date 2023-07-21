@@ -165,7 +165,12 @@ class GlobEmitter extends EventEmitter {
         }
         const { client } = req.params;
         log.debug('abridging transactions for status');
-        const abridgedSess = structuredClone(clients.get(client).session);
+        // this is a shallow clone, we can't mutate the meterValues array here
+        const clone = {...clients.get(client).session};
+        // we can't structuredClone something with functions, so we have to delete those
+        delete clone.startTimeout;
+        delete clone.endTimeout;
+        const abridgedSess = structuredClone(clone);
         // if there's more than one transaction, take the last one
         for(const txId in abridgedSess.transactions){
             const tx = abridgedSess.transactions[txId];
@@ -311,6 +316,7 @@ class GlobEmitter extends EventEmitter {
     });
 
     app.get('/metrics', (req, res) => {
+        res.set('content-type', 'text/plain');
         res.status(200).send(
 `foo {charger="grizzbox"} 1
 bar {charger="grizzbox"}
@@ -472,6 +478,7 @@ bar {charger="grizzbox"}
                 }
                 client.session.startTime = startTime.format();
                 client.session.startTimeout = setTimeout(async () => {
+                    delete client.session.startTimeout;
                     const endTime = moment();
                     const dayOfWeek = now.day();
                     log.silly(`day of week: ${dayOfWeek}`);
@@ -493,6 +500,7 @@ bar {charger="grizzbox"}
                     }
                     client.session.endTime = endTime.format();
                     client.session.endTimeout = setTimeout(async () => {
+                        delete client.session.endTimeout;
                         const response = await safeCall('RemoteStopTransaction', { transactionId: client.session.transactionId });
                         if(response.status === 'Accepted'){
                             log.info('Remote stop worked!', response);
