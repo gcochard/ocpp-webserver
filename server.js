@@ -483,9 +483,9 @@ bar {charger="grizzbox"}
                     const dayOfWeek = now.day();
                     log.silly(`day of week: ${dayOfWeek}`);
                     if(dayOfWeek == 0 || dayOfWeek == 6 || dayOfWeek == 7){
-                        endTime.hour(14);
+                        endTime.hour(14).minute(0).second(0);
                     } else {
-                        endTime.hour(6);
+                        endTime.hour(6).minute(0).second(0);
                     }
                     const response = await safeCall('RemoteStartTransaction', { connectorId: params.connectorId, idTag: charger_name });
 
