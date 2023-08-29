@@ -110,6 +110,7 @@ function exitHandler(eventName){
         }
     };
 }
+
 // ctrl+c doesn't trigger the `exit` event, so we have to handle it in SIGINT
 process.on('exit', exitHandler('exit'));
 process.on('SIGINT', exitHandler('SIGINT'));
@@ -117,7 +118,7 @@ let state = {};
 try {
     state = require('./state.json');
     for(const client of Object.values(state)){
-        log.debug(`loading state for client: ${client.sessionId}`);
+        log.info(`loading state for client: ${client.sessionId}`);
         clients.set(client.sessionId, {session: {...client}});
     }
 } catch(e){
@@ -180,6 +181,11 @@ class GlobEmitter extends EventEmitter {
                 // take the first 75 and last 25
                 abridgedSess.transactions[txId].meterValues = [...tx.meterValues.slice(0, 75), ...tx.meterValues.slice(-25)];
             }
+        }
+        if(abridgedSess.statusNotifications.length > 25){
+            log.debug(`abridging statusNotifications`);
+            // take the last 25
+            abridgedSess.statusNotifications = [...abridgedSess.statusNotifications.slice(-25)];
         }
         const sess = util.inspect(abridgedSess, {compact: false, depth: 8});
         res.send(
@@ -260,7 +266,7 @@ class GlobEmitter extends EventEmitter {
         try{
             const response = await clients.get(req.params.client).call('Reset', { type: 'Soft' });
             log.debug(response);
-            res.status(200).send('terminated connection');
+            res.status(200).json(response);
         } catch(e) {
             log.error(e);
             res.status(503).send(e.message);
@@ -281,6 +287,17 @@ class GlobEmitter extends EventEmitter {
             return res.status(503).send('Client not connected');
         }
         const client = clients.get(req.params.client);
+        res.json(client.session.transactions);
+    });
+
+    app.get('/clients/:client/transactions/:transaction', async (req, res) => {
+        if(!clients.has(req.params.client)){
+            return res.status(404).send('Client not connected');
+        }
+        const client = clients.get(req.params.client);
+        if(!client.session.transactions[req.params.transaction]){
+            return res.status(404).send('Transaction not found');
+        }
         res.json(client.session.transactions);
     });
 
@@ -507,6 +524,16 @@ bar {charger="grizzbox"}
                         } else {
                             log.warn('Remote stop rejected.', response);
                         }
+                        // seems the grizzl-e needs a soft reset after ending a transaction
+                        // wait 10s and do it
+                        setTimeout(async () => {
+                            const response = await clients.get(req.params.client).call('Reset', { type: 'Soft' });
+                            if(response.status === 'Accepted'){
+                                log.info('Soft reset worked!', response);
+                            } else {
+                                log.warn('Soft reset rejected.', response);
+                            }
+                        }, 10*1000);
                     }, endTime.diff(now));
                 }, startTime.diff(now));
             } else if(params.status == 'Available'){
@@ -570,8 +597,13 @@ bar {charger="grizzbox"}
         client.handle('MeterValues', ({params}) => {
             log.info(`Server got MeterValues from ${client.identity}:`, params);
             log.info(params.meterValue[0].sampledValue);
+            if(client.session.transactionId != params.transactionId){
+                client.session.lastTransactionId = client.session.transactionId;
+                client.session.transactionId = params.transactionId;
+            }
             ee.emit(`${client.session.sessionId}:MeterValues`, params);
-            client.session.transactions[client.session.transactionId].meterValues.push(params);
+            client.session.transactions[params.transactionId] ??= {meterValues: []};
+            client.session.transactions[params.transactionId].meterValues.push(params);
             return {};
         });
 
